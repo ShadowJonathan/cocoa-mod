@@ -7,8 +7,8 @@ pub struct Choker {
     // Send buffer
     pub buf: VecDeque<(usize, Vec<u8>)>,
 
-    // (MID, acked, retransmission counter, rtt, data)
-    pub window: Vec<(usize, u8, Option<Duration>, Vec<u8>)>,
+    // (MID, acked, retransmission counter, init/rtt, data)
+    pub window: Vec<(usize, u8, PacketState, Vec<u8>)>,
 
     pub rto: RTO,
     pub rto_start: Instant,
@@ -35,10 +35,12 @@ impl Choker {
         &mut self.buf
     }
 
-    pub fn set_ack(&mut self, mid: usize, rtt: Duration) {
-        for (w_mid, _, d, _) in &mut self.window {
+    pub fn set_ack(&mut self, mid: usize, now: Instant) {
+        for (w_mid, _, p, _) in &mut self.window {
             if *w_mid == mid {
-                *d = Some(rtt);
+                if let &mut PacketState::Waiting(rtt) = p {
+                    *p = PacketState::Acked(rtt.duration_since(now))
+                }
                 break;
             }
         }
@@ -54,15 +56,26 @@ impl Choker {
         })
     }
 
+    // Call this function at the deadline of every rto_end it gives back
+    //
     // Ticks at rto_end, prunes window and calculates new rto,
     // retains unacked packets, fills window with new packets,
     // sets and returns new rto_end, and the MIDs of the packets to be (re)transmitted
     pub fn rto_tick(&mut self, now: Instant) -> (Instant, Vec<usize>) {
-        let acked: usize = self.window[..self.relevant_window_len()].iter().filter(|e| e.2.is_some()).count();
+        let acked: usize = self.window[..self.relevant_window_len()]
+            .iter()
+            .filter(|e| {
+                if let PacketState::Acked(_) = e.2 {
+                    true
+                } else {
+                    false
+                }
+            })
+            .count();
 
         self.window.retain(|(_, transmissions, rtt, _)| {
-            if let Some(rtt) = rtt {
-                self.rto.calc(*transmissions, *rtt, acked);
+            if let &PacketState::Acked(rtt) = rtt {
+                self.rto.calc(*transmissions, rtt, acked);
 
                 false
             } else {
@@ -113,7 +126,7 @@ impl Choker {
         while self.window_max > self.window.len() {
             // fill the window with elements from the buffer
             if let Some((mid, data)) = self.buf.pop_back() {
-                self.window.push((mid, 0, None, data))
+                self.window.push((mid, 0, PacketState::Waiting(now), data))
             } else {
                 break;
             }
@@ -123,7 +136,9 @@ impl Choker {
         self.rto_end = self.rto_start + self.rto();
 
         let mids: Vec<_> = self.window[..self.relevant_window_len()]
-            .iter().map(|e| e.0).collect();
+            .iter()
+            .map(|e| e.0)
+            .collect();
 
         (self.rto_end, mids)
     }
@@ -205,4 +220,9 @@ pub fn bias(a: f64, weight: f64, b: f64) -> f64 {
 pub enum WindowState {
     Rising { factor: usize, conseq: u8 },
     Halted,
+}
+
+pub enum PacketState {
+    Waiting(Instant),
+    Acked(Duration),
 }
